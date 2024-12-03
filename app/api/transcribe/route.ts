@@ -13,11 +13,11 @@ export async function POST(req: Request): Promise<Response> {
       return new Response("File not provided", { status: 400 });
     }
 
-    const transcription = await openai.audio.transcriptions.{
+    const transcription = await openai.audio.transcriptions.create({
       file,
       model: "whisper-1",
     });
-
+    
     return new Response(JSON.stringify(transcription), {
       status: 200,
       headers: { "Content-Type": "application/json" },
