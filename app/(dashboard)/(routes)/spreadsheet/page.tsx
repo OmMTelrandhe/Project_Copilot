@@ -145,7 +145,7 @@ import "@copilotkit/react-ui/styles.css";
 import React, { useState } from "react";
 import Sidebar from "./components/Sidebar";
 import SingleSpreadsheet from "./components/SingleSpreadsheet";
-import { CopilotKit, useCopilotAction, useCopilotReadable } from "@copilotkit/react-core";
+import { ActionRenderProps, CopilotKit, useCopilotAction, useCopilotReadable } from "@copilotkit/react-core";
 import { CopilotSidebar } from "@copilotkit/react-ui";
 import { INSTRUCTIONS } from "./instructions";
 import { canonicalSpreadsheetData } from "./utils/canonicalSpreadsheetData";
@@ -217,8 +217,38 @@ const Main = () => {
         description: "The title of the spreadsheet",
       },
     ],
-    render: (props: { args: { rows: any; title: any; }; }) => {
-      const { rows, title } = props.args;
+    render: (
+      props: ActionRenderProps<
+        [
+          {
+            readonly name: "rows";
+            readonly type: "object[]";
+            readonly description: "The rows of the spreadsheet";
+            readonly attributes: [
+              {
+                readonly name: "cells";
+                readonly type: "object[]";
+                readonly description: "The cells of the row";
+                readonly attributes: [
+                  {
+                    readonly name: "value";
+                    readonly type: "string";
+                    readonly description: "The value of the cell";
+                  }
+                ];
+              }
+            ];
+          },
+          {
+            readonly name: "title";
+            readonly type: "string";
+            readonly description: "The title of the spreadsheet";
+          }
+        ]
+      >
+    ) => {
+      const { args } = props;
+      const { rows, title } = args || {};
       const newRows = canonicalSpreadsheetData(rows);
 
       return (
@@ -237,7 +267,7 @@ const Main = () => {
         />
       );
     },
-    handler: ({  }) => {
+    handler: ({}) => {
       // Do nothing.
       // The preview component will optionally handle committing the changes.
     },
