@@ -1,8 +1,8 @@
-import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-import { ChatOpenAI } from "@langchain/openai";
-import { StateGraph, END, START } from "@langchain/langgraph";
-import { RunnableLambda } from "@langchain/core/runnables";
 import { TavilySearchAPIRetriever } from "@langchain/community/retrievers/tavily_search_api";
+import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import { RunnableLambda } from "@langchain/core/runnables";
+import { Annotation, END, MemorySaver, StateGraph } from "@langchain/langgraph";
+import { ChatOpenAI } from "@langchain/openai";
 
 interface AgentState {
   topic: string;
@@ -11,6 +11,15 @@ interface AgentState {
   critique?: string;
 }
 
+const StateAnnotation = Annotation.Root({
+  agentState: Annotation<AgentState>({
+    value: (x: AgentState, y: AgentState) => y,
+    default: () => ({
+      topic: "",
+    }),
+  }),
+});
+
 function model() {
   return new ChatOpenAI({
     temperature: 0,
@@ -18,165 +27,120 @@ function model() {
   });
 }
 
-async function search(state: { agentState: AgentState }) {
+async function search(state: typeof StateAnnotation.State) {
   const retriever = new TavilySearchAPIRetriever({ k: 10 });
-  let topic = state.agentState.topic.trim();
-  if (topic.length < 5) {
-    topic = "topic: " + topic;
-  }
-  const docs = await retriever.getRelevantDocuments(topic).catch((err) => {
-    console.error("Search API Error:", err);
-    return [];
-  });
-
+  let topic = state.agentState.topic;
+  if (topic.length < 5) topic = "topic: " + topic;
+  const docs = await retriever.invoke(topic);
   return {
-    agentState: {
-      ...state.agentState,
-      searchResults: JSON.stringify(docs),
-    },
+    agentState: { ...state.agentState, searchResults: JSON.stringify(docs) },
   };
 }
 
-async function curate(state: { agentState: AgentState }) {
-  const response = await model().invoke([
-    new SystemMessage(
-      `You are a personal newspaper editor. Return a list of URLs of the 5 most relevant articles as a JSON list of strings in the format:
-      { urls: ["url1", "url2", "url3", "url4", "url5"] }`
-    ),
-    new HumanMessage(
-      `Today's date is ${new Date().toLocaleDateString("en-GB")}.
-      Topic: ${state.agentState.topic}
-      Articles: ${state.agentState.searchResults || "[]"}`
-    ),
-  ]);
-
-  let urls: string[] = [];
-  try {
-    urls = JSON.parse(response.content as string).urls;
-  } catch (error) {
-    console.error("Curate Response Parsing Error:", error);
-  }
-
-  const searchResults = JSON.parse(state.agentState.searchResults || "[]");
-  const newSearchResults = searchResults.filter((result: any) =>
-    urls.includes(result.metadata.source)
+async function curate(state: typeof StateAnnotation.State) {
+  const response = await model().invoke(
+    [
+      new SystemMessage(
+        'Return 5 most relevant article URLs as JSON: {urls: ["url1",...]}'
+      ),
+      new HumanMessage(
+        `Topic: ${state.agentState.topic}\nArticles: ${state.agentState.searchResults}`
+      ),
+    ],
+    { response_format: { type: "json_object" } }
   );
 
+  const urls = JSON.parse(response.content as string).urls;
+  const searchResults = JSON.parse(state.agentState.searchResults!);
+  const filtered = searchResults.filter((r: any) =>
+    urls.includes(r.metadata.source)
+  );
   return {
     agentState: {
       ...state.agentState,
-      searchResults: JSON.stringify(newSearchResults),
+      searchResults: JSON.stringify(filtered),
     },
   };
 }
 
-async function write(state: { agentState: AgentState }) {
+async function write(state: typeof StateAnnotation.State) {
+  const response = await model().invoke([
+    new SystemMessage("Write a 5-paragraph article in markdown."),
+    new HumanMessage(
+      `Topic: ${state.agentState.topic}\nSources: ${state.agentState.searchResults}`
+    ),
+  ]);
+  return {
+    agentState: { ...state.agentState, article: response.content as string },
+  };
+}
+
+async function critique(state: typeof StateAnnotation.State) {
+  const feedback = state.agentState.critique
+    ? `Previous critique: ${state.agentState.critique}`
+    : "";
   const response = await model().invoke([
     new SystemMessage(
-      `You are a newspaper writer. Write a well-written article of 5 paragraphs in markdown based on the topic and sources provided.`
+      "Review article. Return [DONE] if good, or provide brief feedback."
     ),
-    new HumanMessage(
-      `Today's date: ${new Date().toLocaleDateString("en-GB")}.
-      Topic: ${state.agentState.topic}
-      Sources: ${state.agentState.searchResults || "[]"}`
-    ),
+    new HumanMessage(`${feedback}\nArticle: ${state.agentState.article}`),
   ]);
-
+  const content = response.content as string;
   return {
     agentState: {
       ...state.agentState,
-      article: response.content as string,
+      critique: content.includes("[DONE]") ? undefined : content,
     },
   };
 }
 
-async function critique(state: { agentState: AgentState }) {
-  const critiqueResponse = await model().invoke([
-    new SystemMessage(
-      `You are a writing critique. Provide short feedback if necessary or return [DONE] if the article is satisfactory.`
-    ),
+async function revise(state: typeof StateAnnotation.State) {
+  const response = await model().invoke([
+    new SystemMessage("Edit article based on critique."),
     new HumanMessage(
-      `Article: ${state.agentState.article || ""}
-      Critique: ${state.agentState.critique || ""}`
+      `Article: ${state.agentState.article}\nCritique: ${state.agentState.critique}`
     ),
   ]);
-
-  const critiqueContent = critiqueResponse.content as string;
-
   return {
-    agentState: {
-      ...state.agentState,
-      critique: critiqueContent.includes("[DONE]") ? undefined : critiqueContent,
-    },
+    agentState: { ...state.agentState, article: response.content as string },
   };
 }
 
-async function revise(state: { agentState: AgentState }) {
-  const revisionResponse = await model().invoke([
-    new SystemMessage(
-      `You are an editor. Revise the article based on the critique provided.`
-    ),
-    new HumanMessage(
-      `Article: ${state.agentState.article || ""}
-      Critique: ${state.agentState.critique || ""}`
-    ),
-  ]);
-
-  return {
-    agentState: {
-      ...state.agentState,
-      article: revisionResponse.content as string,
-    },
-  };
+function shouldContinue(state: typeof StateAnnotation.State) {
+  return state.agentState.critique === undefined ? "end" : "continue";
 }
 
-const workflow = new StateGraph({
-  channels: {
-    agentState: {
-      value: (x: AgentState, y: AgentState) => ({ ...x, ...y }),
-      default: () => ({
-        topic: "",
-        searchResults: "",
-        article: "",
-        critique: "",
-      }),
-    },
-    channels: null
-  },
-});
+export async function createNewspaperWorkflow() {
+  const workflow = new StateGraph(StateAnnotation)
+    .addNode("search", new RunnableLambda({ func: search }))
+    .addNode("curate", new RunnableLambda({ func: curate }))
+    .addNode("write", new RunnableLambda({ func: write }))
+    .addNode("critique", new RunnableLambda({ func: critique }))
+    .addNode("revise", new RunnableLambda({ func: revise }))
+    .addEdge("search", "curate")
+    .addEdge("curate", "write")
+    .addEdge("write", "critique")
+    .addConditionalEdges("critique", shouldContinue, {
+      continue: "revise",
+      end: END,
+    })
+    .addEdge("revise", "critique")
+    .addEdge("__start__", "search");
 
-// Add all nodes properly
-workflow.addNode("search", new RunnableLambda({ func: search }));
-workflow.addNode("curate", new RunnableLambda({ func: curate }));
-workflow.addNode("write", new RunnableLambda({ func: write }));
-workflow.addNode("critique", new RunnableLambda({ func: critique }));
-workflow.addNode("revise", new RunnableLambda({ func: revise }));
-
-// Ensure the edges are between valid nodes
-workflow.addEdge(START, "search");
-workflow.addEdge("search", "curate");
-workflow.addEdge("curate", "write");
-workflow.addEdge("write", "critique");
-// workflow.addConditionalEdges("critique", shouldContinue, {
-//   continue: "revise",
-//   end: END,
-// });
-workflow.addEdge("revise", "critique");
-
-const app = workflow.compile();
-
-// Helper function for critiquing
-function shouldContinue(state: { agentState: AgentState }) {
-  return state.agentState.critique ? "continue" : "end";
+  const checkpointer = new MemorySaver();
+  return workflow.compile({ checkpointer });
 }
 
 export async function researchWithLangGraph(topic: string) {
-  const inputs = {
-    agentState: {
-      topic,
-    },
-  };
-  const result = await app.invoke(inputs);
-  return result.agentState.article.replace(/<FEEDBACK>[\s\S]*?<\/FEEDBACK>/g, "");
+  const app = await createNewspaperWorkflow();
+  const result = await app.invoke(
+    { agentState: { topic } },
+    {
+      configurable: { thread_id: "research-" + Date.now(), checkpoint_id: "1" },
+    }
+  );
+  return result.agentState.article?.replace(
+  /<FEEDBACK>[\s\S]*?<\/FEEDBACK>/g,
+  ""
+);
 }
-
